@@ -18,7 +18,7 @@ DEFAULT_BANNER_URL = "https://raw.githubusercontent.com/RUBS-new/Heroku-Modules/
 
 @loader.tds
 class NewYearCountdownMod(loader.Module):
-    
+    """Показывает, сколько осталось до Нового года."""
 
     def config_complete(self):
         if self.config["Banner URL"] == "CHANGE_ME":
