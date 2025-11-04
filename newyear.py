@@ -1,24 +1,27 @@
 # ========================
 # ✨ DEVELOPER: @RUBS_New ✨
 # ========================
-
 # meta developer: @RUBS_New
 # meta banner: https://raw.githubusercontent.com/RUBS-new/Heroku-Modules/refs/heads/main/banner/banner_newyear.png
 # meta pic: https://raw.githubusercontent.com/RUBS-new/Heroku-Modules/refs/heads/main/banner/banner_newyear.png
 # meta name: NewYearCountdown
 # scope: hikka_only
-# meta version: 1.1.3 
+# meta version: 1.2.0 
 
 import datetime
 import random
+import asyncio 
 from .. import loader, utils
 from telethon.tl.patched import Message
+import logging
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BANNER_URL = "https://raw.githubusercontent.com/RUBS-new/Heroku-Modules/refs/heads/main/banner/banner_newyear.png"
 
 @loader.tds
 class NewYearCountdownMod(loader.Module):
-    """Показывает, сколько осталось до Нового года."""
+    
 
     def config_complete(self):
         if self.config["Banner URL"] == "CHANGE_ME":
@@ -31,7 +34,18 @@ class NewYearCountdownMod(loader.Module):
                 "CHANGE_ME",
                 lambda: "URL-адрес картинки для отображения вместе с отсчётом. "
                         "Если URL не задан, используется баннер из метаданных модуля.",
-            )
+            ),
+            # НОВЫЕ НАСТРОЙКИ
+            loader.ConfigValue(
+                "UpdateIntervalSeconds",
+                60, # 1 минута по умолчанию
+                lambda: "Интервал обновления таймера (в секундах). Рекомендуется: 60 (1 минута). Минимум: 5 секунд.",
+            ),
+            loader.ConfigValue(
+                "TotalDurationSeconds",
+                3600, # 1 час по умолчанию
+                lambda: "Общая продолжительность работы таймера (в секундах). После этого времени обновление сообщения прекратится.",
+            ),
         )
         self.messages = [
             "✨ Скоро будет ёлка и мандарины! ✨",
@@ -47,6 +61,9 @@ class NewYearCountdownMod(loader.Module):
             "❄️ Пусть Новый год принесёт много радости! ❄️",
             "🎆 До волшебства осталось совсем немного! 🎆"
         ]
+        # Для хранения активных таймеров (чтобы не запускать дважды в одном чате)
+        self.active_timers = {} 
+
 
     strings = {
         "name": "NewYearCountdown",
@@ -60,7 +77,10 @@ class NewYearCountdownMod(loader.Module):
             "🎅 <i>{message}</i>\n\n"
             "❆═══════════════════════❆"
         ),
-        "no_photo": "<b>🎄 До Нового {next_year} года осталось:</b>\n\n{countdown_text}\n\n<i>⚠️ Баннер не найден. Проверьте настройки модуля.</i>"
+        "no_photo": "<b>🎄 До Нового {next_year} года осталось:</b>\n\n{countdown_text}\n\n<i>⚠️ Баннер не найден. Проверьте настройки модуля.</i>",
+        "update_stopped": "⏸️ <b>Обновление остановлено.</b> Достигнута максимальная продолжительность таймера ({duration} сек) или команда остановлена.",
+        "timer_running": "⚠️ **Таймер уже запущен** в этом чате. Для его остановки используйте команду `.stopcountdown`.",
+        "no_active_timer": "⚠️ **Нет активного таймера** в этом чате."
     }
     
     def _get_countdown(self):
@@ -85,17 +105,64 @@ class NewYearCountdownMod(loader.Module):
             "message": message
         }
 
-    @loader.command(ru_doc="Показать отсчёт до Нового года")
+    async def _update_loop(self, chat_id, status_msg, photo_url, update_interval, total_duration):
+        """Внутренняя функция для цикла обновления сообщения."""
+        start_time = datetime.datetime.now()
+        
+        try:
+            while (datetime.datetime.now() - start_time).total_seconds() < total_duration:
+                # Ожидание интервала
+                await asyncio.sleep(update_interval)
+
+                # Проверка, не удалено ли сообщение
+                if not status_msg.media and not status_msg.text:
+                    break 
+
+                countdown_data = self._get_countdown()
+                new_caption = self.strings["countdown"].format(**countdown_data)
+
+                # Редактирование, только если не наступил Новый год
+                if countdown_data["days"] >= 0:
+                    await status_msg.edit(caption=new_caption, file=photo_url, parse_mode="HTML")
+                else:
+                    break # Новый год наступил
+
+            # Завершающее сообщение
+            await status_msg.edit(caption=self.strings["update_stopped"].format(duration=total_duration), file=photo_url, parse_mode="HTML")
+            
+        except asyncio.CancelledError:
+            # Ручная остановка таймера
+            pass
+        except Exception as e:
+            logger.error(f"Error in NewYear countdown loop: {e}")
+        finally:
+            if chat_id in self.active_timers:
+                del self.active_timers[chat_id]
+
+
+    @loader.command(ru_doc="Показать и запустить отсчёт до Нового года с автообновлением.")
     async def newyear(self, message: Message):
         
+        chat_id = message.to_id
+        
+        # 1. Проверка активного таймера
+        if chat_id in self.active_timers:
+            await utils.answer(message, self.strings["timer_running"])
+            return
+
+        # 2. Получение и валидация настроек
+        update_interval = max(5, self.config["UpdateIntervalSeconds"]) # Минимум 5 секунд
+        total_duration = max(update_interval, self.config["TotalDurationSeconds"])
+
         countdown = self._get_countdown()
         caption_text = self.strings["countdown"].format(**countdown)
-        
         photo_url = self.config["Banner URL"]
+        
+        status_message = None
 
         if photo_url and photo_url != "CHANGE_ME":
             try:
-                await message.client.send_file(
+                status_message = await message.client.send_file(
                     message.to_id, 
                     photo_url, 
                     caption=caption_text, 
@@ -103,11 +170,31 @@ class NewYearCountdownMod(loader.Module):
                 )
                 await message.delete() 
             except Exception as e:
-                text_only = caption_text.replace("🎄 <b>══════ New Year {next_year} ══════</b> 🎄\n\n".format(**countdown), "")
-                output = self.strings["no_photo"].format(next_year=countdown["next_year"], countdown_text=text_only)
-                output += f"\n\n<i>(Ошибка: {e})</i>"
-                await utils.answer(message, output)
-        else:
+                # Фоллбэк: если фото не отправилось, отправляем только текст
+                logger.warning(f"Failed to send photo: {e}")
+                photo_url = None # Сбрасываем URL, чтобы не пытаться отправить его снова в цикле
+                
+        if status_message is None:
             text_only = caption_text.replace("🎄 <b>══════ New Year {next_year} ══════</b> 🎄\n\n".format(**countdown), "")
             output = self.strings["no_photo"].format(next_year=countdown["next_year"], countdown_text=text_only)
-            await utils.answer(message, output)
+            status_message = await utils.answer(message, output)
+            await message.delete() 
+
+
+        # 3. Запуск фонового цикла
+        task = asyncio.create_task(
+            self._update_loop(chat_id, status_message, photo_url, update_interval, total_duration)
+        )
+        self.active_timers[chat_id] = task
+
+
+    @loader.command(ru_doc="Остановить запущенный отсчёт до Нового года.")
+    async def stopcountdown(self, message: Message):
+        """Останавливает активный таймер."""
+        chat_id = message.to_id
+        if chat_id in self.active_timers:
+            task = self.active_timers[chat_id]
+            task.cancel() # Отмена фоновой задачи
+            await utils.answer(message, "✅ **Таймер успешно остановлен**.")
+        else:
+            await utils.answer(message, self.strings["no_active_timer"])
